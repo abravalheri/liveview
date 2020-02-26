@@ -1,7 +1,7 @@
 import fnmatch
 import re
 from asyncio import Queue
-from functools import singledispatch, singledispatchmethod
+from functools import singledispatch
 from typing import Any, Dict, Iterator, Optional, Pattern, Tuple, Union, cast
 from uuid import uuid4
 
@@ -69,22 +69,24 @@ class Channel:
         return self.queue.get_nowait()
 
 
+@singledispatch
+def _find(ref: Matcher, channels: Dict[str, Channel]) -> Iterator[Channel]:
+    # Single dispatch just leave Patter for consideration
+    ref = cast(Pattern, ref)
+    return (ch for k, ch in channels.items() if ref.fullmatch(k))
+
+
+@_find.register
+def _find_str(ref: str, channels: Dict[str, Channel]):
+    return (ch for k, ch in channels.items() if ref == k)
+
+
 class Registry:
     def __init__(self, channels: Optional[Dict[str, Channel]] = None):
         self.channels = channels or {}
 
     def find(self, ref: Matcher) -> Iterator[Channel]:
-        return self._find(compile_pattern(ref))
-
-    @singledispatchmethod  # type: ignore
-    def _find(self, ref: Matcher) -> Iterator[Channel]:
-        # Single dispatch just leave Patter for consideration
-        ref = cast(Pattern, ref)
-        return (ch for k, ch in self.channels.items() if ref.fullmatch(k))
-
-    @_find.register(str)
-    def _find_str(self, ref: str):
-        return (ch for k, ch in self.channels.items() if ref == k)
+        return _find(compile_pattern(ref), self.channels)
 
     def register(self, name: Optional[str] = None, channel: Optional[Channel] = None):
         ref: str = name or str(uuid4())
