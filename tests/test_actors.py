@@ -139,13 +139,13 @@ class TestActor(ActorMixin):
         actor1 = actor()
         actor2 = actor()
 
-        actor1.send("hello world", to=actor2)
+        actor1.send(actor2, "hello world")
         msg1 = await actor2.receive()
-        assert msg1.payload == "hello world"
+        assert msg1.topic == "hello world"
         assert msg1.sender == actor1
-        actor2.send("Ok!", to=msg1.sender)
+        actor2.send(msg1.sender, "Ok!")
         msg2 = await actor1.receive()
-        assert msg2.payload == "Ok!"
+        assert msg2.topic == "Ok!"
         assert msg2.sender == actor2
 
     @pytest.mark.asyncio
@@ -156,14 +156,14 @@ class TestActor(ActorMixin):
         async def respond():
             msg1 = await actor2.receive()
             assert msg1.sender == actor1
-            assert msg1.payload == "hello world"
-            actor2.send("Ok!", to=msg1.sender)
+            assert msg1.topic == "hello world"
+            actor2.send(msg1.sender, "Ok!")
 
         asyncio.create_task(respond())
 
-        actor1.send("hello world", to=actor2)
+        actor1.send(actor2, "hello world")
         msg2 = await actor1.receive()
-        assert msg2.payload == "Ok!"
+        assert msg2.topic == "Ok!"
         assert msg2.sender == actor2
 
     @pytest.mark.asyncio
@@ -173,13 +173,46 @@ class TestActor(ActorMixin):
 
         async def respond():
             msg = await actor2.receive()
-            assert msg.topic == (CALL, "some-topic")
-            assert msg.sender == actor1
+            # Asserts inside asyncio will not be considered
             reply = msg.reply
+            result = 0
+            if msg.topic == (CALL, "some-topic") and msg.sender == actor1:
+                result = 42
             if not reply.cancelled():
-                reply.set_result(42)
+                reply.set_result(result)
 
         asyncio.create_task(respond())
 
         response = await actor1.call(actor2, "some-topic", {"some-payload"})
         assert response == 42
+
+    @pytest.mark.asyncio
+    async def test_cast_receive(self, actor):
+        actor1 = actor()
+        actor2 = actor()
+
+        async def send():
+            actor1.cast(actor2, "some-topic", 42)
+
+        asyncio.create_task(send())
+
+        msg = await actor2.receive()
+        assert msg.topic == (CAST, "some-topic")
+        assert msg.sender == actor1
+        assert msg.payload == 42
+
+    @pytest.mark.asyncio
+    async def test_broadcast_receive(self, actor):
+        actor1 = actor()
+        others = [actor() for _ in range(5)]
+
+        async def send():
+            actor1.broadcast("some-topic", 42)
+
+        asyncio.create_task(send())
+
+        msgs = await asyncio.gather(*[a.receive() for a in others])
+        for msg in msgs:
+            assert msg.topic == (BROADCAST, "some-topic")
+            assert msg.sender == actor1
+            assert msg.payload == 42

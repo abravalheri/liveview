@@ -5,7 +5,7 @@ import time
 from asyncio import Future, Queue
 from collections import deque
 from enum import Enum, auto
-from typing import Awaitable, Dict, Generic, Iterable, Iterator, Optional
+from typing import Any, Awaitable, Dict, Generic, Iterable, Iterator, List, Optional
 from typing import Pattern as Regex
 from typing import Set, Tuple, TypeVar, Union, overload
 
@@ -91,7 +91,7 @@ class Fail(Response):
         return self.value
 
 
-class TopicToken(Enum):
+class TopicToken(_ReprEnum):
     CALL = auto()
     CAST = auto()
     BROADCAST = auto()
@@ -260,10 +260,13 @@ class Actor:
         registry: "Registry",
         queue: Optional[Queue] = None,
         links: Optional[deque] = None,
+        monitors: Optional[Dict[int, "Actor"]] = None,
     ):
         self.registry = registry
         self.queue = queue or Queue()
         self.links = links or deque()
+        self.monitors: Dict[int, "Actor"] = monitors or {}
+        self._monitor_counter = 0
 
     def start(self):
         pass
@@ -271,13 +274,26 @@ class Actor:
     def start_link(self, other):
         # TODO
         self.links.append(other)
+        other.links.append(self)
+
+    def monitor(self, other):
+        i = self._monitor_counter
+        self.monitors[i] = other
+        self._monitor_counter += 1
+        return i
+
+    def demonitor(self, monitor_ref: int):
+        return self.monitors.pop(monitor_ref)
 
     def _solve(self, ref: Union[str, "Actor"]) -> "Actor":
         if isinstance(ref, Actor):
             return ref
         return self.registry[ref]
 
-    def send(self, payload, to: Ref, topic="*", reply=False) -> Optional[Future]:
+    def send(
+        self, to: Ref, topic: str, payload: Any = None, reply=False
+    ) -> Optional[Future]:
+
         if reply:
             loop = asyncio.get_running_loop()
             response: Optional[Future] = loop.create_future()
@@ -299,15 +315,24 @@ class Actor:
                 # In theory, if not timeout is set, it should wait forever
                 raise
 
-    def cast(self, payload, to, topic="*"):
+    def cast(self, to: Ref, topic: str, payload: Any = None):
         return Cast(self._solve(to), topic, payload, self).send_nowait()
 
-    def broadcast(self, payload, to: Union[str, Regex] = "*", topic="*"):
-        for ref in Pattern(to).filter(self.registry.items()):
+    def broadcast(
+        self,
+        topic: str,
+        payload: Any = None,
+        to: Union[str, Regex, List["Actor"]] = "*",
+    ):
+        if isinstance(to, list):
+            receivers = (self._solve(ref) for ref in to)
+        else:
+            receivers = Pattern(to).filter(self.registry.items())
+        for ref in receivers:
             Broadcast(ref, topic, payload, self).send_nowait()
 
     async def call(
-        self, to: Ref, topic: str, payload, timeout: Optional[Number] = None
+        self, on: Ref, topic: str, payload: Any = None, timeout: Optional[Number] = None
     ):
         # Right now, a future is being used to simplify getting the response back.
         # (No complex mailbox needs to be implemented, we don't have to re-enque
@@ -320,7 +345,7 @@ class Actor:
         # the ones that don't match are kept in the mailbox...
         loop = asyncio.get_running_loop()
         reply = loop.create_future()
-        to = self._solve(to)
+        to = self._solve(on)
         message: Call = Call(to, topic, payload, self, reply)
 
         start = time.monotonic()
@@ -331,6 +356,10 @@ class Actor:
         else:
             time_left = max(0, sent_finished - start)
         return await asyncio.wait_for(reply, time_left)
+
+    def terminate(self, reason):
+        # TODO
+        pass
 
 
 class Registry:
