@@ -268,13 +268,21 @@ class Actor:
         self.monitors: Dict[int, "Actor"] = monitors or {}
         self._monitor_counter = 0
 
-    def start(self):
-        pass
-
-    def start_link(self, other):
-        # TODO
+    def link(self, other):
         self.links.append(other)
         other.links.append(self)
+
+    def unlink(self, other):
+        self.links.remove(other)
+        other.links.remove(self)
+
+    def start(self):
+        pass
+        # TODO
+
+    def start_link(self, other):
+        self.link(other)
+        self.start()
 
     def monitor(self, other):
         i = self._monitor_counter
@@ -358,6 +366,18 @@ class Actor:
         return await asyncio.wait_for(reply, time_left)
 
     def terminate(self, reason):
+        # TODO
+        pass
+
+    def handle_call(self, topic):
+        # TODO
+        pass
+
+    def handle_cast(self, topic):
+        # TODO
+        pass
+
+    def handle_info(self, topic):
         # TODO
         pass
 
