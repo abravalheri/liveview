@@ -5,7 +5,7 @@ import time
 from asyncio import Future, Queue
 from collections import deque
 from enum import Enum, auto
-from typing import Any, Awaitable, Dict, Generic, Iterable, Iterator, Optional
+from typing import Awaitable, Dict, Generic, Iterable, Iterator, Optional
 from typing import Pattern as Regex
 from typing import Set, Tuple, TypeVar, Union, overload
 
@@ -58,6 +58,7 @@ class Response(tuple, Generic[T]):
         self = tuple.__new__(cls, (status, value))
         self.status = status
         self.value = value
+        return self
 
     def map(self, fn):
         if self.status == FAIL:
@@ -78,12 +79,12 @@ class Response(tuple, Generic[T]):
 
 class Ok(Response):
     def __new__(cls, value):
-        super().__new__(cls, OK, value)
+        return super().__new__(cls, OK, value)
 
 
 class Fail(Response):
     def __new__(cls, value):
-        super().__new__(cls, FAIL, value)
+        return super().__new__(cls, FAIL, value)
 
     @property
     def reason(self):
@@ -105,38 +106,63 @@ class Message(tuple, Generic[T]):
     to: "Actor"
     topic: TopicType
     payload: T
-    reply_to: ReplyToType
+    sender: "Actor"
+    reply: Optional[Future]
+    """The parameter ``reply`` is not part of the public API of the library"""
 
-    def __new__(cls, to: "Actor", topic: TopicType, payload: T, reply_to: ReplyToType):
-        self = tuple.__new__(cls, (to, topic, payload, reply_to))
+    def __new__(
+        cls,
+        to: "Actor",
+        topic: TopicType,
+        payload: T,
+        sender: "Actor",
+        reply: Optional[Future] = None,
+    ):
+        self = tuple.__new__(cls, (to, topic, payload, sender, reply))
         self.to = to
         self.topic = topic
         self.payload = payload
-        self.reply_to = reply_to
+        self.sender = sender
+        self.reply = reply
+        return self
+
+    def send_nowait(self):
+        """This method is not part of the public API of the library"""
+        self.to.queue.put_nowait(self)
+        return self.reply
+
+    async def send(self, timeout=None) -> Optional[Future]:
+        """This method is not part of the public API of the library"""
+        await asyncio.wait_for(self.to.queue.put(self), timeout)
+        return self.reply
 
 
 class Call(Message[T]):
-    def __new__(cls, to, topic, payload, reply_to):
-        super().__new__(cls, to, (CALL, topic), payload, reply_to)
+    def __new__(cls, to, topic, payload, sender, reply):
+        return super().__new__(cls, to, (CALL, topic), payload, sender, reply)
 
 
 class Cast(Message[T]):
-    def __new__(cls, to, topic, payload, reply_to):
-        super().__new__(cls, to, (CAST, topic), payload, reply_to)
+    reply: None = None
+
+    def __new__(cls, to, topic, payload, sender):
+        return super().__new__(cls, to, (CAST, topic), payload, sender)
 
 
 class Broadcast(Cast[T]):
-    def __new__(cls, to, topic, payload, reply_to):
-        Message.__new__(cls, to, (BROADCAST, topic), payload, reply_to)
+    reply: None = None
+
+    def __new__(cls, to, topic, payload, sender):
+        return Message.__new__(cls, to, (BROADCAST, topic), payload, sender)
 
 
 def uniq(items: Iterable[T], key=id) -> Iterator[T]:
-    seen: Set[Tuple[int, str]] = set()
+    seen: Set[Union[int, str]] = set()
     seen_add = seen.add
     for item in items:
         k = key(item)
         if k not in seen:
-            seen_add(key)
+            seen_add(k)
             yield item
 
 
@@ -149,6 +175,13 @@ class InvalidPattern(ValueError):
             "``fullmatch`` method, {} given.".format(type(value))
         )
         super().__init__(msg, value)
+
+
+class RegisterKeyTaken(KeyError):
+    """Trying to register an actor with a name that is already taken"""
+
+    def __init__(self, ref):
+        super().__init__("There is already an actor registered under this key", ref)
 
 
 def _compile_patten(value: Union[str, Regex]):
@@ -182,7 +215,8 @@ class Pattern:
         return super().__new__(cls)
 
     def __init__(self, value: Union[str, Regex]):
-        self.value = _compile_patten(value)
+        pattern = _compile_patten(value)
+        self.value = pattern
 
     def _filter(self, items: Iterable[Tuple[str, T]]) -> Iterator[T]:
         pattern = self.value
@@ -196,6 +230,12 @@ class Pattern:
     def filter(self, items: Iterable[Tuple[str, T]]) -> Iterator[T]:
         """Return a iterator with all the items that match the pattern"""
         return uniq(self._filter(items))
+
+    def matcher(self):
+        pattern = self.value
+        if isinstance(pattern, str):
+            return lambda item: pattern == item
+        return pattern.fullmatch
 
     @overload
     def first(self, items: Iterable[Tuple[str, T]], default: S) -> Union[T, S]:
@@ -237,23 +277,18 @@ class Actor:
             return ref
         return self.registry[ref]
 
-    @overload
-    def send(self, msg: Message):
-        ...
-
-    @overload  # noqa
-    def send(self, payload: Any, to: Ref, topic: Union[str, Tuple[str]] = "*"):
-        ...
-
-    def send(self, payload, to, topic="*"):  # noqa
-        if isinstance(payload, Message):
-            msg = payload
+    def send(self, payload, to: Ref, topic="*", reply=False) -> Optional[Future]:
+        if reply:
+            loop = asyncio.get_running_loop()
+            response: Optional[Future] = loop.create_future()
         else:
-            msg = Message(to, topic, msg, self)
+            response = None
 
-        self.queue.put_nowait(Message(self._solve(msg.to), *msg[1:]))
+        to = self._solve(to)
+        msg = Message(to, topic, payload, self, response)
+        return msg.send_nowait()
 
-    async def recv(self, timeout: Optional[Number] = None):
+    async def receive(self, timeout: Optional[Number] = None):
         try:
             if timeout == 0:
                 return self.queue.get_nowait()
@@ -265,42 +300,37 @@ class Actor:
                 raise
 
     def cast(self, payload, to, topic="*"):
-        self.send(Cast(to, topic, payload, self))
+        return Cast(self._solve(to), topic, payload, self).send_nowait()
 
     def broadcast(self, payload, to: Union[str, Regex] = "*", topic="*"):
         for ref in Pattern(to).filter(self.registry.items()):
-            self.send(Broadcast(ref, topic, payload, self))
+            Broadcast(ref, topic, payload, self).send_nowait()
 
-    def send_request(
-        self, payload, to: Ref, topic="*", timeout: Optional[Number] = None
-    ) -> Future:
+    async def call(
+        self, to: Ref, topic: str, payload, timeout: Optional[Number] = None
+    ):
+        # Right now, a future is being used to simplify getting the response back.
+        # (No complex mailbox needs to be implemented, we don't have to re-enque
+        # messages received while waiting for a response, etc...)
+        # This approach, however, might make the Message Object "unserializable"
+        # (pickle).
+        # Therefore, in a more serious implementation this would need to change.
+        # Erlang uses process monitor/demonitor with a unique id var for it, but then,
+        # in erlang is just easy to do pattern match in the received messages and all
+        # the ones that don't match are kept in the mailbox...
         loop = asyncio.get_running_loop()
-        response = loop.create_future()
-        message: Message = Call(to, topic, payload, (self, response))
+        reply = loop.create_future()
+        to = self._solve(to)
+        message: Call = Call(to, topic, payload, self, reply)
 
-        if timeout == 0:
-            self.queue.put_nowait(message)
-            return response
-        else:
-
-            async def _send():
-                await asyncio.wait_for(self.queue.put(message), timeout)
-                return await response
-
-            return loop.create_task(_send())
-
-    async def check_response(self, response, timeout):
-        return await asyncio.wait_for(response, timeout)
-
-    async def call(self, payload, to: Ref, topic="*", timeout: Optional[Number] = None):
         start = time.monotonic()
-        response = self.send_request(payload, to, topic, timeout)
+        await message.send(timeout)
         sent_finished = time.monotonic()
         if timeout is None:
             time_left = None
         else:
             time_left = max(0, sent_finished - start)
-        return await self.check_response(response, time_left)
+        return await asyncio.wait_for(reply, time_left)
 
 
 class Registry:
@@ -310,8 +340,11 @@ class Registry:
     def __getitem__(self, key: str) -> Actor:
         return self.actors[key]
 
-    def __contain__(self, key: str) -> bool:
+    def __contains__(self, key: str) -> bool:
         return key in self.actors
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.actors)
 
     @property
     def all(self) -> Iterator[Actor]:
@@ -324,6 +357,6 @@ class Registry:
         actor: Actor = actor or Actor(self)
         ref: str = alias or str(id(actor))
         if ref in self.actors:
-            raise KeyError("Actor already registered", ref)
+            raise RegisterKeyTaken(ref)
         self.actors[ref] = actor
         return actor
