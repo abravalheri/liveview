@@ -214,3 +214,17 @@ class TestActor(ActorMixin):
             assert msg.topic == (BROADCAST, "some-topic")
             assert msg.sender == actor1
             assert msg.payload == 42
+
+    @pytest.mark.asyncio
+    async def test_broadcast_receive__filter(self, actor):
+        actor1 = actor()
+        others = [actor("i" * i) for i in range(5)]
+
+        async def send():
+            actor1.broadcast("some-topic", 42, to="iii*")
+            # Now we broadcast for just the actors named with 3 or more 'i'
+
+        asyncio.create_task(send())
+
+        done, pending = await asyncio.wait([a.receive() for a in others], timeout=0.5)
+        assert len(done) == 2
