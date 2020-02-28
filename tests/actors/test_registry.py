@@ -1,6 +1,7 @@
 import pytest
 
-from liveview.actors import Actor, Registry
+from liveview.actors import Actor
+from liveview.actors.registry import Registry
 
 
 class RegistryMixin:
