@@ -1,14 +1,14 @@
 {
-  "src/liveview/*.py" : {
-    "alternate": "tests/{dirname}/test_{basename}.py",
-    "type": "source",
+  "*.py": {
     "autoformat": true,
     "textwidth": 88
   },
+  "src/liveview/*.py" : {
+    "alternate": "tests/{dirname}/test_{basename}.py",
+    "type": "source"
+  },
   "tests/**/test_*.py" : {
     "alternate": "src/liveview/{dirname}/{basename}.py",
-    "type": "test",
-    "autoformat": true,
-    "textwidth": 88
+    "type": "test"
   }
 }

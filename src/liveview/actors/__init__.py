@@ -5,9 +5,23 @@ import re
 from asyncio import Future, Queue
 from collections import deque
 from enum import Enum, auto
-from typing import Any, Awaitable, Dict, Generic, Iterable, Iterator, List, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Deque,
+    Dict,
+    Generic,
+    Iterable,
+    Iterator,
+    List,
+    Optional
+)
 from typing import Pattern as Regex
 from typing import Set, Tuple, TypeVar, Union, overload
+
+from ..exceptions import init_with_docstring
+from .registry import Registry
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -25,12 +39,18 @@ class _ReprEnum(Enum):
         return f"<{self.__class__.__name__}.{self.name}>"
 
 
-class ReplyToken(_ReprEnum):
+class LcmToken(_ReprEnum):
     REPLY = auto()
     NOREPLY = auto()
+    STOP = auto()
+    DOWN = auto()
+    EXIT = auto()
+    IGNORE = auto()
+    NORMAL = auto()
+    SHUTDOWN = auto()
 
 
-REPLY, NOREPLY = list(ReplyToken)
+REPLY, NOREPLY, STOP, DOWN, EXIT, IGNORE, NORMAL, SHUTDOWN = list(LcmToken)
 
 
 class NoArg(_ReprEnum):
@@ -96,10 +116,10 @@ class Fail(Response):
 class TopicToken(_ReprEnum):
     CALL = auto()
     CAST = auto()
-    BROADCAST = auto()
+    OTHER = auto()
 
 
-CALL, CAST, BROADCAST = list(TopicToken)
+CALL, CAST, OTHER = list(TopicToken)
 TopicType = Union[str, Tuple[TopicToken, str]]
 ReplyToType = Union["Actor", Tuple["Actor", Future]]
 
@@ -128,16 +148,6 @@ class Message(tuple, Generic[T]):
         self.reply = reply
         return self
 
-    def send_nowait(self):
-        """This method is not part of the public API of the library"""
-        self.to.queue.put_nowait(self)
-        return self.reply
-
-    async def send(self) -> Optional[Future]:
-        """This method is not part of the public API of the library"""
-        await self.to.queue.put(self)
-        return self.reply
-
 
 class Call(Message[T]):
     def __new__(cls, to, topic, payload, sender, reply):
@@ -153,9 +163,6 @@ class Cast(Message[T]):
 
 class Broadcast(Cast[T]):
     reply: None = None
-
-    def __new__(cls, to, topic, payload, sender):
-        return Message.__new__(cls, to, (BROADCAST, topic), payload, sender)
 
 
 def uniq(items: Iterable[T], key=id) -> Iterator[T]:
@@ -173,17 +180,10 @@ class InvalidPattern(ValueError):
 
     def __init__(self, value):
         msg = (
-            "Pattern should be a string or an object with a "
-            "``fullmatch`` method, {} given.".format(type(value))
+            f"Pattern should be a string or an object with a ``fullmatch`` method, "
+            "{value} given."
         )
         super().__init__(msg, value)
-
-
-class RegisterKeyTaken(KeyError):
-    """Trying to register an actor with a name that is already taken"""
-
-    def __init__(self, ref):
-        super().__init__("There is already an actor registered under this key", ref)
 
 
 def _compile_patten(value: Union[str, Regex]):
@@ -277,74 +277,86 @@ async def wait_for(awaitable: Awaitable, timeout: Optional[Number] = None):
                 LOGGER.error(msg, exc_info=True)
 
 
+class NotRegistered(SystemError):
+    """Actor is not registered yet and this operation requires the actor to be
+    registered in a `Registry` object
+    """
+
+    __init__ = init_with_docstring
+
+
 class Actor:
     def __init__(
         self,
-        registry: "Registry",
-        queue: Optional[Queue] = None,
-        links: Optional[deque] = None,
-        monitors: Optional[Dict[int, "Actor"]] = None,
+        _registry: Optional[Registry] = None,
+        _queue: Optional[Queue] = None,
+        _links: Optional[Deque["Actor"]] = None,
+        _monitors: Optional[Dict[int, "Actor"]] = None,
     ):
-        self.registry = registry
-        self.queue = queue or Queue()
-        self.links = links or deque()
-        self.monitors: Dict[int, "Actor"] = monitors or {}
+        self._registry = _registry
+        self._queue = _queue or Queue()
+        self._links = _links or deque()
+        self._monitors: Dict[int, "Actor"] = _monitors or {}
         self._monitor_counter = 0
+        self._callbacks: Dict[TopicToken, List[Callable]] = {
+            CALL: [],
+            CAST: [],
+            OTHER: [],
+        }
+        self._loop: Optional[Awaitable] = None
+
+    # ---- Metadata API ----
 
     @property
     def id(self):
         return str(id(self))
 
-    def link(self, other):
+    # ---- Life-Cycle API ----
+
+    def link(self, other: "Actor"):
         """Link the current actor to other"""
-        self.links.append(other)
-        other.links.append(self)
+        self._links.append(other)
+        other._links.append(self)
 
-    def unlink(self, other):
+    def unlink(self, other: "Actor"):
         """Remove link between this actor and other"""
-        self.links.remove(other)
-        other.links.remove(self)
+        self._links.remove(other)
+        other._links.remove(self)
 
-    def start(self):
+    def start(self, init_arg, *, link: Optional["Actor"] = None, **options):
         """Start this actor"""
+        if link:
+            self.link(link)
         # TODO
 
-    def start_link(self, other):
-        """`link` this actor to other and `start` it subsequently
-
-        Opposite of `spawn_link`.
-        """
-        self.link(other)
-        self.start()
-
-    def spawn(self, other):
+    def spawn(self, other: "Actor", init_arg, *, alias=None, link=False, **options):
         """Start other actor (uses the same registry)"""
-        if other.id not in self.registry:
-            self.registry.register(other)
-        other.start(self)
+        if self._registry is not None:
+            if other.id not in self._registry:
+                self._registry.register(other)
+            if alias is not None and alias not in self._registry:
+                self._registry.register(other, alias=alias)
+        if link:
+            options["link"] = self
+        other.start(init_arg, **options)
 
-    def spawn_link(self, other):
-        """`link` other actor to this one and start it subsequently.
-
-        Opposite of `start_link`.
-        """
-        if other.id not in self.registry:
-            self.registry.register(other)
-        other.start_link(self)
-
-    def monitor(self, other):
+    def monitor(self, other: "Actor"):
         i = self._monitor_counter
-        self.monitors[i] = other
+        self._monitors[i] = other
         self._monitor_counter += 1
         return i
 
-    def demonitor(self, monitor_ref: int):
-        return self.monitors.pop(monitor_ref)
+    def demonitor(self, monitor_ref: int) -> "Actor":
+        return self._monitors.pop(monitor_ref)
+
+    # ---- Messaging API ----
 
     def _solve(self, ref: Union[str, "Actor"]) -> "Actor":
         if isinstance(ref, Actor):
             return ref
-        return self.registry[ref]
+        if self._registry is not None:
+            return self._registry[ref]
+        raise NotRegistered(operation="find actor", actor_reference=ref)
 
     def send(
         self, topic: str, payload: Any = None, reply=False, *, to: Ref, wait=False
@@ -357,12 +369,19 @@ class Actor:
         else:
             response = None
 
-        to = self._solve(to)
-        msg = Message(to, topic, payload, self, response)
+        target = self._solve(to)
+        msg = Message(target, topic, payload, self, response)
+
         if wait:
-            return msg.send()
-        else:
-            return msg.send_nowait()
+
+            async def _defer():
+                await target._queue.put(msg)
+                return response
+
+            return _defer()
+
+        target._queue.put_nowait(msg)
+        return response
 
     @overload
     def receive(self) -> Awaitable:
@@ -377,30 +396,36 @@ class Actor:
         When wait is `False`, will return `None` if queue is empty
         """
         if wait:
-            return self.queue.get()
+            return self._queue.get()
         else:
             try:
-                return self.queue.get_nowait()
+                return self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 return None
 
     def cast(self, topic: str, payload: Any = None, *, to: Ref):
         """Send (cast) a message to another actor, without waiting for answer"""
-        return Cast(self._solve(to), topic, payload, self).send_nowait()
+        to = self._solve(to)
+        return to._queue.put_nowait(Cast(to, topic, payload, self))
 
     def broadcast(
         self,
         topic: str,
         payload: Any = None,
         *,
-        to: Union[str, Regex, List["Actor"]] = "*",
+        to: Union[str, Regex, List["Actor"], None] = None,
     ):
         if isinstance(to, list):
             receivers: Iterator["Actor"] = (self._solve(ref) for ref in to)
+        elif self._registry is None:
+            raise NotRegistered(operation="broadcast")
+        elif to is None:
+            receivers = self._registry.actors
         else:
-            receivers = Pattern(to).filter(self.registry.items())
-        for ref in receivers:
-            Broadcast(ref, topic, payload, self).send_nowait()
+            receivers = Pattern(to).filter(self._registry.aliases)
+
+        for target in receivers:
+            target._queue.put_nowait(Broadcast(target, topic, payload, self))
 
     async def call(self, topic: str, payload: Any = None, *, on: Ref):
         # Right now, a future is being used to simplify getting the response back.
@@ -417,10 +442,11 @@ class Actor:
         to = self._solve(on)
         message: Call = Call(to, topic, payload, self, reply)
 
-        await message.send()
+        await to._queue.put(message)
         return await reply
 
-    def terminate(self, reason):
+    # ---- Callback API ----
+    def init(self, function):
         # TODO
         pass
 
@@ -436,31 +462,10 @@ class Actor:
         # TODO
         pass
 
+    def trap_exit(self, topic):
+        # TODO
+        pass
 
-class Registry:
-    def __init__(self, actors: Optional[Dict[str, Actor]] = None):
-        self.actors = actors or {}
-
-    def __getitem__(self, key: str) -> Actor:
-        return self.actors[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.actors
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.actors)
-
-    @property
-    def all(self) -> Iterator[Actor]:
-        return uniq(self.actors.values())
-
-    def items(self) -> Iterable[Tuple[str, Actor]]:
-        return self.actors.items()
-
-    def register(self, alias: Optional[str] = None, actor: Optional[Actor] = None):
-        actor: Actor = actor or Actor(self)
-        ref: str = alias or str(id(actor))
-        if ref in self.actors:
-            raise RegisterKeyTaken(ref)
-        self.actors[ref] = actor
-        return actor
+    def terminate(self, reason):
+        # TODO
+        pass

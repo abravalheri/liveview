@@ -3,21 +3,22 @@ import asyncio
 import pytest
 
 from liveview.actors import (
-    BROADCAST,
     CALL,
     CAST,
     FAIL,
     OK,
+    Actor,
     Broadcast,
     Call,
     Cast,
     Fail,
     Ok,
     Pattern,
-    Registry,
     Response,
     uniq
 )
+
+from .test_registry import RegistryMixin
 
 
 class TestPattern:
@@ -83,7 +84,7 @@ class TestMessage:
             Cast("actor_ref", "topic", {"some": "payload"}, "sender").topic[0] == CAST
         )
         broadcast = Broadcast("actor_ref", "topic", {"some": "payload"}, "sender")
-        assert broadcast.topic[0] == BROADCAST
+        assert broadcast.topic[0] == CAST
         assert isinstance(broadcast, Cast)
 
 
@@ -94,43 +95,10 @@ def test_uniq():
     assert len(list(uniq([obj1, obj1, obj1, obj2, obj2]))) == 2
 
 
-class RegistryMixin:
-    @pytest.fixture
-    def registry(self):
-        return Registry()
-
-
-class TestRegistry(RegistryMixin):
-    def test_register_getitem(self, registry):
-        actor = registry.register("actor")
-        assert actor is not None
-        assert "Actor" in actor.__class__.__name__
-        assert actor is registry["actor"]
-
-    def test_register_taken(self, registry):
-        registry.register("actor")
-        with pytest.raises(KeyError):
-            registry.register("actor")
-
-    def test_register_annonymous__contain(self, registry):
-        actor = registry.register()
-        assert str(id(actor)) in registry
-
-    def test_all(self, registry):
-        actors = [registry.register() for _ in range(5)]
-
-        # Re register some actors
-        registry.register("abc", actors[0])
-        registry.register("def", actors[0])
-        registry.register("ghi", actors[1])
-
-        assert len(list(registry.all)) == 5
-
-
 class ActorMixin(RegistryMixin):
     @pytest.fixture
     def actor(self, registry):
-        return registry.register
+        return lambda alias=None: registry.register(Actor(), alias)
 
 
 class TestActor(ActorMixin):
@@ -211,7 +179,7 @@ class TestActor(ActorMixin):
 
         msgs = await asyncio.gather(*[a.receive() for a in others])
         for msg in msgs:
-            assert msg.topic == (BROADCAST, "some-topic")
+            assert msg.topic == (CAST, "some-topic")
             assert msg.sender == actor1
             assert msg.payload == 42
 
@@ -228,3 +196,5 @@ class TestActor(ActorMixin):
 
         done, pending = await asyncio.wait([a.receive() for a in others], timeout=0.5)
         assert len(done) == 2
+        for p in pending:
+            p.cancel()
