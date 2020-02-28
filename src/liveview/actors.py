@@ -1,7 +1,7 @@
 import asyncio
 import fnmatch
+import logging
 import re
-import time
 from asyncio import Future, Queue
 from collections import deque
 from enum import Enum, auto
@@ -16,6 +16,8 @@ Recipient = TypeVar("Recipient", str, "Actor", Tuple["Actor", Awaitable])
 Topic = TypeVar("Topic", str, Tuple[str, str])
 PatternLike = Union[str, Regex, "Pattern"]
 Number = Union[int, float]
+
+LOGGER = logging.getLogger(__name__)
 
 
 class _ReprEnum(Enum):
@@ -131,9 +133,9 @@ class Message(tuple, Generic[T]):
         self.to.queue.put_nowait(self)
         return self.reply
 
-    async def send(self, timeout=None) -> Optional[Future]:
+    async def send(self) -> Optional[Future]:
         """This method is not part of the public API of the library"""
-        await asyncio.wait_for(self.to.queue.put(self), timeout)
+        await self.to.queue.put(self)
         return self.reply
 
 
@@ -254,6 +256,27 @@ class Pattern:
         return next(self.filter(items), default)
 
 
+async def wait_for(awaitable: Awaitable, timeout: Optional[Number] = None):
+    """Wrapper around `asyncio.wait_for` but returns ``None`` after timeout"""
+    wait: Optional[Awaitable] = None
+    try:
+        wait = asyncio.wait_for(awaitable, timeout)
+        return await wait
+    except asyncio.TimeoutError:
+        if timeout is not None:
+            # In theory, if no timeout is set, it should wait forever
+            raise
+        LOGGER.debug("Timeout reached (%s s). Returning `None`", timeout)
+        return None
+    except asyncio.CancelledError:
+        if wait is not None and hasattr(wait, "cancel"):
+            try:
+                wait.cancel()  # type: ignore
+            except Exception:
+                msg = "Unexpected error when cancelling awaitable"
+                LOGGER.error(msg, exc_info=True)
+
+
 class Actor:
     def __init__(
         self,
@@ -268,21 +291,46 @@ class Actor:
         self.monitors: Dict[int, "Actor"] = monitors or {}
         self._monitor_counter = 0
 
+    @property
+    def id(self):
+        return str(id(self))
+
     def link(self, other):
+        """Link the current actor to other"""
         self.links.append(other)
         other.links.append(self)
 
     def unlink(self, other):
+        """Remove link between this actor and other"""
         self.links.remove(other)
         other.links.remove(self)
 
     def start(self):
-        pass
+        """Start this actor"""
         # TODO
 
     def start_link(self, other):
+        """`link` this actor to other and `start` it subsequently
+
+        Opposite of `spawn_link`.
+        """
         self.link(other)
         self.start()
+
+    def spawn(self, other):
+        """Start other actor (uses the same registry)"""
+        if other.id not in self.registry:
+            self.registry.register(other)
+        other.start(self)
+
+    def spawn_link(self, other):
+        """`link` other actor to this one and start it subsequently.
+
+        Opposite of `start_link`.
+        """
+        if other.id not in self.registry:
+            self.registry.register(other)
+        other.start_link(self)
 
     def monitor(self, other):
         i = self._monitor_counter
@@ -299,8 +347,9 @@ class Actor:
         return self.registry[ref]
 
     def send(
-        self, to: Ref, topic: str, payload: Any = None, reply=False
-    ) -> Optional[Future]:
+        self, topic: str, payload: Any = None, reply=False, *, to: Ref, wait=False
+    ) -> Union[Future, Awaitable, None]:
+        """Send a message from this actor to another one"""
 
         if reply:
             loop = asyncio.get_running_loop()
@@ -310,38 +359,50 @@ class Actor:
 
         to = self._solve(to)
         msg = Message(to, topic, payload, self, response)
-        return msg.send_nowait()
+        if wait:
+            return msg.send()
+        else:
+            return msg.send_nowait()
 
-    async def receive(self, timeout: Optional[Number] = None):
-        try:
-            if timeout == 0:
+    @overload
+    def receive(self) -> Awaitable:
+        ...
+
+    @overload  # noqa
+    def receive(self, wait: bool) -> Any:
+        ...
+
+    def receive(self, wait=True):  # noqa
+        """Receive a message from other actor.
+        When wait is `False`, will return `None` if queue is empty
+        """
+        if wait:
+            return self.queue.get()
+        else:
+            try:
                 return self.queue.get_nowait()
-            else:
-                return await asyncio.wait_for(self.queue.get(), timeout)
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            if timeout is None:
-                # In theory, if not timeout is set, it should wait forever
-                raise
+            except asyncio.QueueEmpty:
+                return None
 
-    def cast(self, to: Ref, topic: str, payload: Any = None):
+    def cast(self, topic: str, payload: Any = None, *, to: Ref):
+        """Send (cast) a message to another actor, without waiting for answer"""
         return Cast(self._solve(to), topic, payload, self).send_nowait()
 
     def broadcast(
         self,
         topic: str,
         payload: Any = None,
+        *,
         to: Union[str, Regex, List["Actor"]] = "*",
     ):
         if isinstance(to, list):
-            receivers = (self._solve(ref) for ref in to)
+            receivers: Iterator["Actor"] = (self._solve(ref) for ref in to)
         else:
             receivers = Pattern(to).filter(self.registry.items())
         for ref in receivers:
             Broadcast(ref, topic, payload, self).send_nowait()
 
-    async def call(
-        self, on: Ref, topic: str, payload: Any = None, timeout: Optional[Number] = None
-    ):
+    async def call(self, topic: str, payload: Any = None, *, on: Ref):
         # Right now, a future is being used to simplify getting the response back.
         # (No complex mailbox needs to be implemented, we don't have to re-enque
         # messages received while waiting for a response, etc...)
@@ -356,14 +417,8 @@ class Actor:
         to = self._solve(on)
         message: Call = Call(to, topic, payload, self, reply)
 
-        start = time.monotonic()
-        await message.send(timeout)
-        sent_finished = time.monotonic()
-        if timeout is None:
-            time_left = None
-        else:
-            time_left = max(0, sent_finished - start)
-        return await asyncio.wait_for(reply, time_left)
+        await message.send()
+        return await reply
 
     def terminate(self, reason):
         # TODO

@@ -139,11 +139,11 @@ class TestActor(ActorMixin):
         actor1 = actor()
         actor2 = actor()
 
-        actor1.send(actor2, "hello world")
+        actor1.send("hello world", to=actor2)
         msg1 = await actor2.receive()
         assert msg1.topic == "hello world"
         assert msg1.sender == actor1
-        actor2.send(msg1.sender, "Ok!")
+        actor2.send("Ok!", to=msg1.sender)
         msg2 = await actor1.receive()
         assert msg2.topic == "Ok!"
         assert msg2.sender == actor2
@@ -155,13 +155,11 @@ class TestActor(ActorMixin):
 
         async def respond():
             msg1 = await actor2.receive()
-            assert msg1.sender == actor1
-            assert msg1.topic == "hello world"
-            actor2.send(msg1.sender, "Ok!")
+            actor2.send("Ok!", to=msg1.sender)
 
         asyncio.create_task(respond())
 
-        actor1.send(actor2, "hello world")
+        await actor1.send("hello world", to=actor2, wait=True)
         msg2 = await actor1.receive()
         assert msg2.topic == "Ok!"
         assert msg2.sender == actor2
@@ -183,7 +181,7 @@ class TestActor(ActorMixin):
 
         asyncio.create_task(respond())
 
-        response = await actor1.call(actor2, "some-topic", {"some-payload"})
+        response = await actor1.call("some-topic", {"some-payload"}, on=actor2)
         assert response == 42
 
     @pytest.mark.asyncio
@@ -192,7 +190,7 @@ class TestActor(ActorMixin):
         actor2 = actor()
 
         async def send():
-            actor1.cast(actor2, "some-topic", 42)
+            actor1.cast("some-topic", 42, to=actor2)
 
         asyncio.create_task(send())
 
