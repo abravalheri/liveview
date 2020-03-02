@@ -1,6 +1,11 @@
 exclude: '^docs/conf.py'
 
 repos:
+- repo: https://github.com/asottile/seed-isort-config
+  rev: v2.1.0
+  hooks:
+  - id: seed-isort-config
+
 - repo: git://github.com/pre-commit/pre-commit-hooks
   rev: v2.5.0
   hooks:
@@ -33,11 +38,6 @@ repos:
   - id: bandit
     args: [--exclude, tests/]
 
-- repo: https://github.com/asottile/seed-isort-config
-  rev: v2.1.0
-  hooks:
-  - id: seed-isort-config
-
 - repo: https://github.com/pre-commit/mirrors-isort
   rev: v4.3.21
   hooks:
@@ -45,8 +45,8 @@ repos:
     alias: prepare-for-autoflake
     args: [-sl]
 
-- repo: https://github.com/humitos/mirrors-autoflake.git
-  rev: v1.1
+- repo: https://github.com/abravalheri/autoflake.git
+  rev: pre-commit
   hooks:
   - id: autoflake
     args: [
