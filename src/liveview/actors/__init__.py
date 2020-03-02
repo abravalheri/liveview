@@ -1,3 +1,8 @@
+"""Very simplified "actor system" based on erlang's GenServer.
+
+Actors here do not really run in parallel, instead they run concurrently using
+`asyncio`.
+"""
 import asyncio
 import logging
 from asyncio import Future, Queue
@@ -11,6 +16,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    NewType,
     Optional
 )
 from typing import Pattern as Regex
@@ -27,6 +33,7 @@ T = TypeVar("T")
 S = TypeVar("S")
 Ref = Union[str, "Actor"]
 Recipient = TypeVar("Recipient", str, "Actor", Tuple["Actor", Awaitable])
+MonitorRef = NewType("MonitorRef", int)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +47,8 @@ class NotRegistered(SystemError):
 
 
 class Actor:
+    """Main interface of the "Actor" system."""
+
     def __init__(
         self,
         _registry: Optional["Registry"] = None,
@@ -47,6 +56,9 @@ class Actor:
         _links: Optional[Deque["Actor"]] = None,
         _monitors: Optional[Dict[int, "Actor"]] = None,
     ):
+        """Calling the constructor with arguments should be avoided.
+        Arguments are part of the private API.
+        """
         self._registry = _registry
         self._queue = _queue or Queue()
         self._links = _links or deque()
@@ -63,28 +75,29 @@ class Actor:
 
     @property
     def id(self):
-        return str(id(self))
+        """Actor identifier."""
+        return id(self)
 
     # ---- Life-Cycle API ----
 
     def link(self, other: "Actor"):
-        """Link the current actor to other"""
+        """Link the current actor to other."""
         self._links.append(other)
         other._links.append(self)
 
     def unlink(self, other: "Actor"):
-        """Remove link between this actor and other"""
+        """Remove link between this actor and other."""
         self._links.remove(other)
         other._links.remove(self)
 
     def start(self, init_arg, *, link: Optional["Actor"] = None, **options):
-        """Start this actor"""
+        """Start this actor."""
         if link:
             self.link(link)
         # TODO
 
     def spawn(self, other: "Actor", init_arg, *, alias=None, link=False, **options):
-        """Start other actor (uses the same registry)"""
+        """Start other actor (using the current actor's registry)."""
         if self._registry is not None:
             if other.id not in self._registry:
                 self._registry.register(other)
@@ -94,13 +107,27 @@ class Actor:
             options["link"] = self
         other.start(init_arg, **options)
 
-    def monitor(self, other: "Actor"):
+    def monitor(self, other: "Actor") -> MonitorRef:
+        """Start monitoring another actor.
+
+        When monitoring another actor, the current actor will receive
+        messages in the case something ages badly.
+
+        Returns:
+            Reference that can be used later to stop the monitoring routine.
+            See `~.demonitor`.
+        """
         i = self._monitor_counter
         self._monitors[i] = other
         self._monitor_counter += 1
         return i
 
-    def demonitor(self, monitor_ref: int) -> "Actor":
+    def demonitor(self, monitor_ref: MonitorRef) -> "Actor":
+        """Given some previously defined monitoring.
+
+        Arguments:
+            monitor_ref: Output of the `~.monitor` that stated the monitoring routine.
+        """
         return self._monitors.pop(monitor_ref)
 
     # ---- Messaging API ----
@@ -115,7 +142,34 @@ class Actor:
     def send(
         self, topic: str, payload: Any = None, reply=False, *, to: Ref, wait=False
     ) -> Union[Future, Awaitable, None]:
-        """Send a message from this actor to another one"""
+        """Send a message from this actor to another one.
+
+        Messages sent via this method are usually handled with a `~.handle_info`
+        callback (or manually with the `~.receive` method).
+
+        Arguments:
+            topic: Main part of the message. The actor that receives this message will
+                try to match on the topic to try to determine which callback will be
+                applied. See `handle_info`.
+            payload: Extra object that will be send along side with ``topic``.
+                Ideally this should be serializable (JSON/pickle).
+
+        Keyword Arguments:
+            reply: Flag that indicates if the current actor should wait for a reply
+                message. When true, the method will return an `Awaitable` object (with
+                the response).  `False` by default.
+            to: Reference to the actor that will receive the message
+            wait: Flag that indicates if the current actor should wait to make sure the
+                message was at least delivered. When `True`, the caller should use an
+                `await` directive. `False` by default.
+
+        Note:
+            When both ``reply`` and ``wait`` are `True`, the caller should `await` first
+            to the message to be sent and then for the response::
+
+                reply = await actor.send(msg, to=other, reply=True, wait=True)
+                response = await reply
+        """
 
         if reply:
             loop = asyncio.get_running_loop()
@@ -142,12 +196,20 @@ class Actor:
         ...
 
     @overload  # noqa
-    def receive(self, wait: bool) -> Any:
+    def receive(self, wait: bool) -> Any:  # noqa
         ...
 
     def receive(self, wait=True):  # noqa
         """Receive a message from other actor.
-        When wait is `False`, will return `None` if queue is empty
+        When wait is `False`, will return `None` if queue is empty.
+
+        This is a low level method, a `~.handle_info` callback should cover the majority
+        of the use cases.
+
+        Arguments:
+            wait: When `True` (default) this method works asynchronously and therefore
+                should be used with an `await` directive. When `False` the method will
+                return immediately (if no message is received `None` will be passed).
         """
         if wait:
             return self._queue.get()
@@ -158,7 +220,11 @@ class Actor:
                 return None
 
     def cast(self, topic: str, payload: Any = None, *, to: Ref):
-        """Send (cast) a message to another actor, without waiting for answer"""
+        """Send (cast) a message to another actor, without waiting for answer.
+
+        The target actor will process this message using a `~.handle_cast` callback.
+        The arguments of this method are similar to those in `~.send`.
+        """
         to = self._solve(to)
         return to._queue.put_nowait(Cast(to, topic, payload, self))
 
@@ -169,6 +235,15 @@ class Actor:
         *,
         to: Union[str, Regex, List["Actor"], None] = None,
     ):
+        """Send (cast) a message to a group of actors, without waiting for answer.
+
+        This method works similarly to `~.cast` however needs a list of actors or a
+        valid name pattern as the ``to`` argument, so it can send multiple messages.
+
+        Raises:
+            NotRegistered: If a pattern is used but the actor is not registered in any
+                `registry <Registry>`.
+        """
         if isinstance(to, list):
             receivers: Iterator["Actor"] = (self._solve(ref) for ref in to)
         elif self._registry is None:
@@ -182,6 +257,14 @@ class Actor:
             target._queue.put_nowait(Broadcast(target, topic, payload, self))
 
     async def call(self, topic: str, payload: Any = None, *, on: Ref):
+        """Send a ``call`` message to an actor synchronously and wait for the answer.
+
+        The target actor will process this message using a `~.handle_call` callback.
+        The arguments of this method are similar to those in `~.send`.
+
+        Returns:
+            An `Awaitable` object with the value send back by the target actor.
+        """
         # Right now, a future is being used to simplify getting the response back.
         # (No complex mailbox needs to be implemented, we don't have to re-enque
         # messages received while waiting for a response, etc...)
