@@ -80,7 +80,7 @@ class Pattern:
         ...
 
     @overload  # noqa
-    def first(self, items: Iterable[Tuple[str, T]]) -> T:
+    def first(self, items: Iterable[Tuple[str, T]]) -> T:  # noqa
         ...
 
     def first(  # noqa
