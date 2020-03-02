@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Generic, Optional, Tuple, TypeVar, Union
 from ..utils import ReprEnum
 
 if TYPE_CHECKING:
-    from . import Actor
+    from . import Actor, MonitorRef  # noqa
 
 T = TypeVar("T")
 
@@ -92,8 +92,8 @@ class Message(tuple, Generic[T]):
     topic: TopicType
     payload: T
     sender: "Actor"
-    reply: Optional[Future]
-    """The parameter ``reply`` is not part of the public API of the library"""
+    _monitor_ref: Optional["MonitorRef"] = None
+    """The parameter ``monitor_ref`` is not part of the public API of the library"""
 
     def __new__(
         cls,
@@ -101,14 +101,14 @@ class Message(tuple, Generic[T]):
         topic: TopicType,
         payload: T,
         sender: "Actor",
-        reply: Optional[Future] = None,
+        _monitor_ref: Optional["MonitorRef"] = None,
     ):
-        self = tuple.__new__(cls, (to, topic, payload, sender, reply))
+        self = tuple.__new__(cls, (to, topic, payload, sender, _monitor_ref))
         self.to = to
         self.topic = topic
         self.payload = payload
         self.sender = sender
-        self.reply = reply
+        self._monitor_ref = _monitor_ref
         return self
 
 

@@ -53,12 +53,10 @@ class TestActor(ActorMixin):
         async def respond():
             msg = await actor2.receive()
             # Asserts inside asyncio will not be considered
-            reply = msg.reply
             result = 0
             if msg.topic == (CALL, "some-topic") and msg.sender == actor1:
                 result = 42
-            if not reply.cancelled():
-                reply.set_result(result)
+            await actor2.send_reply(result, to=msg.sender)
 
         asyncio.create_task(respond())
 

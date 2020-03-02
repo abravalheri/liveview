@@ -5,7 +5,7 @@ Actors here do not really run in parallel, instead they run concurrently using
 """
 import asyncio
 import logging
-from asyncio import Future, Queue
+from asyncio import Queue
 from collections import deque
 from typing import (
     TYPE_CHECKING,
@@ -53,6 +53,7 @@ class Actor:
         self,
         _registry: Optional["Registry"] = None,
         _queue: Optional[Queue] = None,
+        _signaling_queue: Optional[Queue] = None,
         _links: Optional[Deque["Actor"]] = None,
         _monitors: Optional[Dict[int, "Actor"]] = None,
     ):
@@ -61,6 +62,13 @@ class Actor:
         """
         self._registry = _registry
         self._queue = _queue or Queue()
+        # ^  Regular queue where regular messages should arrive
+        self._signaling_queue = _signaling_queue or Queue()
+        # ^  Privileged queue where error notifications and "reply" messages should
+        #    arrive.
+        #    To avoid receiving new requests while still waiting for replies or to avoid
+        #    an error slipping unnoticed while we listen to regular messages, a
+        #    separated queue is necessary.
         self._links = _links or deque()
         self._monitors: Dict[int, "Actor"] = _monitors or {}
         self._monitor_counter = 0
@@ -107,6 +115,28 @@ class Actor:
             options["link"] = self
         other.start(init_arg, **options)
 
+    def _add_monitor(self, other: "Actor") -> MonitorRef:
+        """Be monitored by another actor.
+
+        The other actor will receive messages in the case something ages badly.
+
+        Returns:
+            Reference that can be used later to stop the monitoring routine.
+            See `~.demonitor`.
+        """
+        i = self._monitor_counter
+        self._monitors[i] = other
+        self._monitor_counter += 1
+        return MonitorRef(i)
+
+    def _remove_monitor(self, monitor_ref: MonitorRef) -> "Actor":
+        """Remove some previously defined monitoring.
+
+        Arguments:
+            monitor_ref: Output of the `~.monitor` that stated the monitoring routine.
+        """
+        return self._monitors.pop(monitor_ref)
+
     def monitor(self, other: "Actor") -> MonitorRef:
         """Start monitoring another actor.
 
@@ -117,18 +147,16 @@ class Actor:
             Reference that can be used later to stop the monitoring routine.
             See `~.demonitor`.
         """
-        i = self._monitor_counter
-        self._monitors[i] = other
-        self._monitor_counter += 1
-        return i
+        return other._add_monitor(self)
 
-    def demonitor(self, monitor_ref: MonitorRef) -> "Actor":
-        """Given some previously defined monitoring.
+    def demonitor(self, other: "Actor", monitor_ref: MonitorRef) -> "Actor":
+        """Remove some previously defined monitoring.
 
         Arguments:
+            other: Actor being monitored.
             monitor_ref: Output of the `~.monitor` that stated the monitoring routine.
         """
-        return self._monitors.pop(monitor_ref)
+        return other._remove_monitor(monitor_ref)
 
     # ---- Messaging API ----
 
@@ -140,8 +168,8 @@ class Actor:
         raise NotRegistered(operation="find actor", actor_reference=ref)
 
     def send(
-        self, topic: str, payload: Any = None, reply=False, *, to: Ref, wait=False
-    ) -> Union[Future, Awaitable, None]:
+        self, topic: str, payload: Any = None, *, to: Ref, wait=False
+    ) -> Union[Awaitable, None]:
         """Send a message from this actor to another one.
 
         Messages sent via this method are usually handled with a `~.handle_info`
@@ -155,41 +183,34 @@ class Actor:
                 Ideally this should be serializable (JSON/pickle).
 
         Keyword Arguments:
-            reply: Flag that indicates if the current actor should wait for a reply
-                message. When true, the method will return an `Awaitable` object (with
-                the response).  `False` by default.
             to: Reference to the actor that will receive the message
             wait: Flag that indicates if the current actor should wait to make sure the
                 message was at least delivered. When `True`, the caller should use an
-                `await` directive. `False` by default.
+                `await` directive on the return value of this function.
+                `False` by default.
 
-        Note:
-            When both ``reply`` and ``wait`` are `True`, the caller should `await` first
-            to the message to be sent and then for the response::
-
-                reply = await actor.send(msg, to=other, reply=True, wait=True)
-                response = await reply
+        Returns:
+            Awaitable: if ``wait`` is `True`
         """
 
-        if reply:
-            loop = asyncio.get_running_loop()
-            response: Optional[Future] = loop.create_future()
-        else:
-            response = None
-
         target = self._solve(to)
-        msg = Message(target, topic, payload, self, response)
+        msg = Message(target, topic, payload, self)
 
         if wait:
-
-            async def _defer():
-                await target._queue.put(msg)
-                return response
-
-            return _defer()
+            return target._queue.put(msg)
 
         target._queue.put_nowait(msg)
-        return response
+        return None
+
+    async def send_error(self, msg, to: Ref):
+        # TODO
+        target = self._solve(to)
+        await target._signaling_queue.put(msg)
+
+    async def send_reply(self, msg, to: Ref):
+        # TODO
+        target = self._solve(to)
+        await target._signaling_queue.put(msg)
 
     @overload
     def receive(self) -> Awaitable:
@@ -263,7 +284,7 @@ class Actor:
         The arguments of this method are similar to those in `~.send`.
 
         Returns:
-            An `Awaitable` object with the value send back by the target actor.
+            Value send back by the target actor.
         """
         # Right now, a future is being used to simplify getting the response back.
         # (No complex mailbox needs to be implemented, we don't have to re-enque
@@ -274,13 +295,15 @@ class Actor:
         # Erlang uses process monitor/demonitor with a unique id var for it, but then,
         # in erlang is just easy to do pattern match in the received messages and all
         # the ones that don't match are kept in the mailbox...
-        loop = asyncio.get_running_loop()
-        reply = loop.create_future()
-        to = self._solve(on)
-        message: Call = Call(to, topic, payload, self, reply)
-
-        await to._queue.put(message)
-        return await reply
+        target = self._solve(on)
+        monitor_ref = self.monitor(target)
+        message: Call = Call(target, topic, payload, self, monitor_ref)
+        try:
+            await target._queue.put(message)
+            return await self._signaling_queue.get()
+            # TODO do something with error
+        finally:
+            self.demonitor(target, monitor_ref)
 
     # ---- Callback API ----
     def init(self, function):

@@ -158,7 +158,7 @@ html_context = {
 # html_theme_options = {"sidebar_width": "300px", "page_width": "1200px"}
 html_theme_options = {
     "navigation_depth": 50,
-    "style_external_links": True,
+    "style_external_links": False,
     "github_url": "https://github.com/abravalheri/liveview/",
 }
 
