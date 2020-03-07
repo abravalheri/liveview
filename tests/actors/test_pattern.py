@@ -2,8 +2,6 @@ import pytest
 
 from liveview.actors.pattern import pattern
 
-pytestmark = pytest.mark.only
-
 
 class TestPattern:
     @pytest.fixture
