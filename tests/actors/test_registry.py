@@ -35,3 +35,13 @@ class TestRegistry(RegistryMixin):
         registry.register(actors[1], "ghi")
 
         assert len(list(registry.actors)) == 5
+
+    def test_get_aliases(self, registry):
+        actor = registry.register(Actor(), alias="a1")
+        registry.register(actor, alias="a2")
+        assert list(registry.get_aliases(actor)) == ["a1", "a2"]
+        assert registry.get_alias(actor) == "a1"
+
+        actor = registry.register(Actor())
+        assert list(registry.get_aliases(actor)) == []
+        assert registry.get_alias(actor) is None

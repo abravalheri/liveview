@@ -7,6 +7,7 @@ import asyncio
 import logging
 from asyncio import Queue
 from collections import deque
+from enum import auto
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -17,14 +18,36 @@ from typing import (
     Iterator,
     List,
     NewType,
-    Optional
+    Optional,
+    Pattern as Regex,
+    Tuple,
+    TypeVar,
+    Union,
+    overload
 )
-from typing import Pattern as Regex
-from typing import Tuple, TypeVar, Union, overload
 
 from ..exceptions import init_with_docstring
-from .messaging import CALL, CAST, OTHER, Broadcast, Call, Cast, Message, TopicToken
-from .pattern import Pattern
+from .messaging import (
+    CALL,
+    CAST,
+    DOWN,
+    ERROR,
+    EXIT,
+    IGNORE,
+    OK,
+    OTHER,
+    SHUTDOWN,
+    STOP,
+    Call,
+    Cast,
+    Error,
+    Message,
+    Other,
+    ReprEnum,
+    Response,
+    Token as TopicToken
+)
+from .pattern import pattern
 
 if TYPE_CHECKING:
     from .registry import Registry  # noqa
@@ -38,12 +61,46 @@ MonitorRef = NewType("MonitorRef", int)
 LOGGER = logging.getLogger(__name__)
 
 
+class CallbackToken(ReprEnum):
+    INIT = auto()
+    TERMINATE = auto()
+
+
+INIT, TERMINATE = list(CallbackToken)
+
+
 class NotRegistered(SystemError):
     """Actor is not registered yet and this operation requires the actor to be
-    registered in a `Registry` object
+    registered in a `Registry` object.
     """
 
     __init__ = init_with_docstring
+
+
+class UnexpectedResponse(SystemError):
+    """Received response does not comply with the callback specification."""
+
+    __init__ = init_with_docstring
+
+
+def _get_nowait(queue):
+    try:
+        return queue.get_nowait()
+    except asyncio.QueueEmpty:
+        return None
+
+
+def _extract_error(msg) -> Optional[Response]:
+    if isinstance(msg, Exception):
+        return Error(msg)
+    if (
+        isinstance(msg, tuple)
+        and len(msg) == 2
+        and msg[0] in (ERROR, DOWN, EXIT, SHUTDOWN)
+    ):
+        return Response(*msg)
+
+    return None
 
 
 class Actor:
@@ -53,7 +110,7 @@ class Actor:
         self,
         _registry: Optional["Registry"] = None,
         _queue: Optional[Queue] = None,
-        _signaling_queue: Optional[Queue] = None,
+        _reply_queue: Optional[Queue] = None,
         _links: Optional[Deque["Actor"]] = None,
         _monitors: Optional[Dict[int, "Actor"]] = None,
     ):
@@ -63,7 +120,7 @@ class Actor:
         self._registry = _registry
         self._queue = _queue or Queue()
         # ^  Regular queue where regular messages should arrive
-        self._signaling_queue = _signaling_queue or Queue()
+        self._reply_queue = _reply_queue or Queue()
         # ^  Privileged queue where error notifications and "reply" messages should
         #    arrive.
         #    To avoid receiving new requests while still waiting for replies or to avoid
@@ -72,12 +129,15 @@ class Actor:
         self._links = _links or deque()
         self._monitors: Dict[int, "Actor"] = _monitors or {}
         self._monitor_counter = 0
-        self._callbacks: Dict[TopicToken, List[Callable]] = {
+        self._callbacks: Dict[Union[TopicToken, CallbackToken], List[Callable]] = {
             CALL: [],
             CAST: [],
             OTHER: [],
+            INIT: [],
+            TERMINATE: [],
         }
         self._loop: Optional[Awaitable] = None
+        self._running = False
 
     # ---- Metadata API ----
 
@@ -85,6 +145,40 @@ class Actor:
     def id(self):
         """Actor identifier."""
         return id(self)
+
+    def __str__(self):
+        alias = self._registry.get_alias(self) if self._registry else None
+        return f"<Actor id={self.id} alias={alias}>"
+
+    # ---- Implementation ----
+
+    async def _run(self, init_arg, **options):
+        try:
+            while self._running:
+                # Process received message
+                msg, = await asyncio.gather(self._queue.get(), return_exceptions=True)
+                self._handle_message(msg)
+                self._queue.task_done()
+        except Exception as ex:
+            self._handle_error(Error(ex))
+
+    async def _handle_message(self, msg):
+        error = _extract_error(msg)
+        if error:
+            self._handle_error(error)
+
+    async def _handle_call(self, msg):
+        pass
+
+    async def _handle_cast(self, msg):
+        pass
+
+    async def _handle_info(self, msg):
+        pass
+
+    async def _handle_error(self, msg):
+        self._running = False
+        # TODO
 
     # ---- Life-Cycle API ----
 
@@ -98,11 +192,23 @@ class Actor:
         self._links.remove(other)
         other._links.remove(self)
 
-    def start(self, init_arg, *, link: Optional["Actor"] = None, **options):
+    async def start(self, init_arg, *, link: Optional["Actor"] = None, **options):
         """Start this actor."""
         if link:
             self.link(link)
         # TODO
+        response = await self._init(init_arg)
+        if response.status == STOP:
+            return Error(response.reason)
+        if response.status == IGNORE:
+            return IGNORE
+        if response.status != OK:
+            return Error(UnexpectedResponse(response, "Expecting OK, IGNORE or STOP"))
+
+        state = response.value
+        self._running = True
+        self._loop = asyncio.create_task(self._run(state))
+        return self._loop
 
     def spawn(self, other: "Actor", init_arg, *, alias=None, link=False, **options):
         """Start other actor (using the current actor's registry)."""
@@ -194,7 +300,7 @@ class Actor:
         """
 
         target = self._solve(to)
-        msg = Message(target, topic, payload, self)
+        msg: Message = Other(target, topic, payload, self)
 
         if wait:
             return target._queue.put(msg)
@@ -202,15 +308,10 @@ class Actor:
         target._queue.put_nowait(msg)
         return None
 
-    async def send_error(self, msg, to: Ref):
-        # TODO
-        target = self._solve(to)
-        await target._signaling_queue.put(msg)
-
     async def send_reply(self, msg, to: Ref):
         # TODO
         target = self._solve(to)
-        await target._signaling_queue.put(msg)
+        await target._reply_queue.put(msg)
 
     @overload
     def receive(self) -> Awaitable:
@@ -235,10 +336,7 @@ class Actor:
         if wait:
             return self._queue.get()
         else:
-            try:
-                return self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return None
+            return _get_nowait(self._queue)
 
     def cast(self, topic: str, payload: Any = None, *, to: Ref):
         """Send (cast) a message to another actor, without waiting for answer.
@@ -246,8 +344,8 @@ class Actor:
         The target actor will process this message using a `~.handle_cast` callback.
         The arguments of this method are similar to those in `~.send`.
         """
-        to = self._solve(to)
-        return to._queue.put_nowait(Cast(to, topic, payload, self))
+        target = self._solve(to)
+        return target._queue.put_nowait(Cast(target, topic, payload, self))
 
     def broadcast(
         self,
@@ -272,10 +370,11 @@ class Actor:
         elif to is None:
             receivers = self._registry.actors
         else:
-            receivers = Pattern(to).filter(self._registry.aliases)
+            match = pattern(to)
+            receivers = (v for k, v in self._registry.aliases if match(k))
 
         for target in receivers:
-            target._queue.put_nowait(Broadcast(target, topic, payload, self))
+            target._queue.put_nowait(Cast(target, topic, payload, self))
 
     async def call(self, topic: str, payload: Any = None, *, on: Ref):
         """Send a ``call`` message to an actor synchronously and wait for the answer.
@@ -286,21 +385,12 @@ class Actor:
         Returns:
             Value send back by the target actor.
         """
-        # Right now, a future is being used to simplify getting the response back.
-        # (No complex mailbox needs to be implemented, we don't have to re-enque
-        # messages received while waiting for a response, etc...)
-        # This approach, however, might make the Message Object "unserializable"
-        # (pickle).
-        # Therefore, in a more serious implementation this would need to change.
-        # Erlang uses process monitor/demonitor with a unique id var for it, but then,
-        # in erlang is just easy to do pattern match in the received messages and all
-        # the ones that don't match are kept in the mailbox...
         target = self._solve(on)
         monitor_ref = self.monitor(target)
         message: Call = Call(target, topic, payload, self, monitor_ref)
         try:
             await target._queue.put(message)
-            return await self._signaling_queue.get()
+            return await self._reply_queue.get()
             # TODO do something with error
         finally:
             self.demonitor(target, monitor_ref)

@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from liveview.actors import Actor
-from liveview.actors.messaging import CALL, CAST
+from liveview.actors.messaging import CALL, CAST, OTHER
 
 from .test_registry import RegistryMixin
 
@@ -22,11 +22,11 @@ class TestActor(ActorMixin):
 
         actor1.send("hello world", to=actor2)
         msg1 = await actor2.receive()
-        assert msg1.topic == "hello world"
+        assert msg1.topic == (OTHER, "hello world")
         assert msg1.sender == actor1
         actor2.send("Ok!", to=msg1.sender)
         msg2 = await actor1.receive()
-        assert msg2.topic == "Ok!"
+        assert msg2.topic == (OTHER, "Ok!")
         assert msg2.sender == actor2
 
     @pytest.mark.asyncio
@@ -42,7 +42,7 @@ class TestActor(ActorMixin):
 
         await actor1.send("hello world", to=actor2, wait=True)
         msg2 = await actor1.receive()
-        assert msg2.topic == "Ok!"
+        assert msg2.topic == (OTHER, "Ok!")
         assert msg2.sender == actor2
 
     @pytest.mark.asyncio

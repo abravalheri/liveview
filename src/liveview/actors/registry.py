@@ -59,7 +59,7 @@ class Registry:
         elif isinstance(actor, str):
             ref = self._aliases.get(actor)
         else:
-            ref = id(actor)
+            ref = actor.id
         return ref in self._actors
 
     def __iter__(self) -> Iterator["Actor"]:
@@ -75,7 +75,7 @@ class Registry:
 
     def register(self, actor: "Actor", alias: Optional[str] = None) -> "Actor":
         actor: "Actor" = actor
-        id_ = id(actor)
+        id_ = actor.id
         self._actors[id_] = actor
         if alias is not None:
             if alias in self._aliases:
@@ -90,9 +90,17 @@ class Registry:
         if alias is not None:
             self._aliases.pop(alias)
         if actor is not None:
-            id_ = id(actor)
+            actor._registry = None
+            id_ = actor.id
             self._actors.pop(id_, None)
             # Also remove all the aliases this actor may have
             aliases: Iterable[str] = self._rev_aliases.pop(id_, [])
             for alias in aliases:
                 self._aliases.pop(alias, None)
+
+    def get_aliases(self, actor: "Actor") -> Iterator[str]:
+        id_ = actor.id
+        return iter(self._rev_aliases.get(id_, []))
+
+    def get_alias(self, actor: "Actor") -> Optional[str]:
+        return next(self.get_aliases(actor), None)
