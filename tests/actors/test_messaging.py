@@ -1,12 +1,11 @@
 from liveview.actors.messaging import (
     CALL,
     CAST,
-    FAIL,
+    ERROR,
     OK,
-    Broadcast,
     Call,
     Cast,
-    Fail,
+    Error,
     Ok,
     Response
 )
@@ -20,8 +19,8 @@ class TestResponse:
         assert Response(OK, 9).map(square).value == 81
         assert Ok(9).map(square).value == 81
         error = SystemError("bla", 2)
-        assert Response(FAIL, error).map(square).value is error
-        assert Fail(error).map(square).value is error
+        assert Response(ERROR, error).map(square).value is error
+        assert Error(error).map(square).value is error
 
     def test_fix(self):
         def square(ex):
@@ -31,8 +30,8 @@ class TestResponse:
         error = SystemError("bla", 2)
         assert Response(OK, 9).fix(square).value == 9
         assert Ok(9).fix(square).value == 9
-        assert Response(FAIL, error).fix(square).value == 4
-        assert Fail(error).fix(square).value == 4
+        assert Response(ERROR, error).fix(square).value == 4
+        assert Error(error).fix(square).value == 4
 
 
 class TestMessage:
@@ -44,6 +43,3 @@ class TestMessage:
         assert (
             Cast("actor_ref", "topic", {"some": "payload"}, "sender").topic[0] == CAST
         )
-        broadcast = Broadcast("actor_ref", "topic", {"some": "payload"}, "sender")
-        assert broadcast.topic[0] == CAST
-        assert isinstance(broadcast, Cast)

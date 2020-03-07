@@ -1,57 +1,66 @@
 import logging
 from asyncio import Future
-from enum import auto
+from enum import IntEnum
 from typing import TYPE_CHECKING, Generic, Optional, Tuple, TypeVar, Union
 
-from ..utils import ReprEnum
-
 if TYPE_CHECKING:
-    from . import Actor, MonitorRef  # noqa
+    from . import Actor, MonitorRef as Reference  # noqa
 
 T = TypeVar("T")
 
 LOGGER = logging.getLogger(__name__)
 
 
-class LcmToken(ReprEnum):
-    REPLY = auto()
-    NOREPLY = auto()
-    STOP = auto()
-    DOWN = auto()
-    EXIT = auto()
-    IGNORE = auto()
-    NORMAL = auto()
-    SHUTDOWN = auto()
+class Token(IntEnum):
+    OTHER = -1
+    OK = 0
+    ERROR = 1
+    CALL = 2
+    CAST = 3
+    REPLY = 4
+    NOREPLY = 5
+    STOP = 6
+    DOWN = 7
+    EXIT = 8
+    IGNORE = 9
+    NORMAL = 10
+    SHUTDOWN = 11
 
 
-REPLY, NOREPLY, STOP, DOWN, EXIT, IGNORE, NORMAL, SHUTDOWN = list(LcmToken)
-
-
-class SuccessToken(ReprEnum):
-    OK = auto()
-    FAIL = auto()
-
-
-OK, FAIL = list(SuccessToken)
+(
+    OTHER,
+    OK,
+    ERROR,
+    CALL,
+    CAST,
+    REPLY,
+    NOREPLY,
+    STOP,
+    DOWN,
+    EXIT,
+    IGNORE,
+    NORMAL,
+    SHUTDOWN,
+) = list(Token)
 
 
 class Response(tuple, Generic[T]):
-    status: SuccessToken
+    status: Token
     value: T
 
-    def __new__(cls, status: SuccessToken, value: T):
+    def __new__(cls, status: Token, value: T):
         self = tuple.__new__(cls, (status, value))
         self.status = status
         self.value = value
         return self
 
     def map(self, fn):
-        if self.status == FAIL:
+        if self.status == ERROR:
             return self
         try:
             return Ok(fn(self.value))
         except Exception as ex:
-            return Fail(ex)
+            return Error(ex)
 
     def fix(self, fn):
         if self.status == OK:
@@ -59,7 +68,7 @@ class Response(tuple, Generic[T]):
         try:
             return Ok(fn(self.value))
         except Exception as ex:
-            return Fail(ex)
+            return Error(ex)
 
 
 class Ok(Response):
@@ -67,62 +76,54 @@ class Ok(Response):
         return super().__new__(cls, OK, value)
 
 
-class Fail(Response):
+class Error(Response):
     def __new__(cls, value):
-        return super().__new__(cls, FAIL, value)
+        return super().__new__(cls, ERROR, value)
 
     @property
     def reason(self):
         return self.value
 
 
-class TopicToken(ReprEnum):
-    CALL = auto()
-    CAST = auto()
-    OTHER = auto()
-
-
-CALL, CAST, OTHER = list(TopicToken)
-TopicType = Union[str, Tuple[TopicToken, str]]
 ReplyToType = Union["Actor", Tuple["Actor", Future]]
+Topic = Tuple[Token, str]
 
 
 class Message(tuple, Generic[T]):
     to: "Actor"
-    topic: TopicType
+    topic: Topic
     payload: T
     sender: "Actor"
-    _monitor_ref: Optional["MonitorRef"] = None
+    reference: Optional["Reference"] = None
     """The parameter ``monitor_ref`` is not part of the public API of the library"""
 
     def __new__(
         cls,
         to: "Actor",
-        topic: TopicType,
+        topic: Topic,
         payload: T,
         sender: "Actor",
-        _monitor_ref: Optional["MonitorRef"] = None,
+        reference: Optional["Reference"] = None,
     ):
-        self = tuple.__new__(cls, (to, topic, payload, sender, _monitor_ref))
+        self = tuple.__new__(cls, (to, topic, payload, sender, reference))
         self.to = to
         self.topic = topic
         self.payload = payload
         self.sender = sender
-        self._monitor_ref = _monitor_ref
+        self.reference = reference
         return self
 
 
+class Other(Message[T]):
+    def __new__(cls, to, topic, payload, sender, reference=None):
+        return super().__new__(cls, to, (OTHER, topic), payload, sender)
+
+
 class Call(Message[T]):
-    def __new__(cls, to, topic, payload, sender, reply):
-        return super().__new__(cls, to, (CALL, topic), payload, sender, reply)
+    def __new__(cls, to, topic, payload, sender, reference=None):
+        return super().__new__(cls, to, (CALL, topic), payload, sender)
 
 
 class Cast(Message[T]):
-    reply: None = None
-
     def __new__(cls, to, topic, payload, sender):
         return super().__new__(cls, to, (CAST, topic), payload, sender)
-
-
-class Broadcast(Cast[T]):
-    reply: None = None
