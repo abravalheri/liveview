@@ -52,3 +52,4 @@ repos:
   rev: v4.3.21
   hooks:
   - id: isort
+    args: [--combine-as]
