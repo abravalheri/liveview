@@ -83,13 +83,9 @@ def _compile_seq_pattern(value: Union[tuple, list]) -> Matcher:
 class Pattern:
     """Callable object that matches the __init__ arg with the __call__ arg.
 
-    This is the base class of the hierarchy and is very dump
+    The preferable way of creating patterns however is to use the auxiliary functions:
+    `re`, `glob` and `pattern`.
     """
-
-    def __new__(cls, value: Any):
-        if isinstance(value, Pattern):
-            return value
-        return object.__new__(cls)
 
     def __init__(self, value: Any):
         self._value = value
@@ -102,26 +98,33 @@ class Pattern:
         except TypeError:
             return False
 
-    def _format(self):
+    def _format_inner(self):
         return pformat(self._value, sort_dicts=False)
 
-    def __str__(self):
-        return f"{type(self).__name__}({self._format()})"
-
     def __repr__(self):
-        return f"<{type(self).__name__} at {id(self):#x} -> {self._format()}>"
+        return f"{type(self).__name__}({self._format_inner()})"
 
 
 def re(value: str, flags: FlagsType = 0):
+    """Given a string with a Regular Expression pattern, create a `Pattern` object."""
     return Pattern(_re.compile(value, flags))
 
 
 def glob(value: str):
+    """Given a string with a simple glob pattern, create a `Pattern` object."""
     return Pattern(_re.compile(fnmatch.translate(value)))
 
 
 def pattern(value, *other) -> Pattern:
+    """Create a pattern that mathches the argument.
+
+    Tuples and Lists will be analysed recursively, so `re`, `glob` and `pattern` can be
+    nested.
+    """
     if len(other) > 0:
         value = (value, *other)
+
+    if isinstance(value, Pattern):
+        return value
 
     return Pattern(value)
