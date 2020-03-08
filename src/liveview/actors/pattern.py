@@ -1,22 +1,9 @@
 import fnmatch
-import re
+import re as _re
 from pprint import pformat
-from typing import (
-    Any,
-    AnyStr,
-    Callable,
-    Iterable,
-    Iterator,
-    Match,
-    Optional,
-    Pattern as Regex,
-    Protocol,
-    TypeVar,
-    Union,
-    cast
-)
+from typing import Any, Callable, Iterator, Protocol, Union, cast
 
-from ..utils import NO_VALUE, suppress
+from ..utils import NO_VALUE
 
 Anything = Ellipsis
 
@@ -32,44 +19,25 @@ class InvalidPattern(ValueError):
         super().__init__(msg, value)
 
 
-T = TypeVar("T")
-S = TypeVar("S")
-M = TypeVar("M", bound="Matchable")
-FlagsType = Union[int, re.RegexFlag]
-Matcher = Union[
-    Callable[[Any], Any],
-    Callable[[AnyStr], Optional[Match]],
-    Callable[[AnyStr, FlagsType], Optional[Match]],
-]
-Matchable = Union["_Matchable", Regex]
-PatternLike = Union[str, Matchable, "Pattern"]
+FlagsType = Union[int, _re.RegexFlag]
+Matcher = Callable[[Any], Any]
 
 
-class _Matchable(Protocol):
+class Matchable(Protocol):
     """Polymorphic typing that applies to regexes or any other object that tries to
     mimic them by implementing the `~.fullmatch` method.
     """
 
     def fullmatch(self, value: Any) -> Any:
-        """Mimics `re.fullmatch`."""
+        """Mimics `_re.fullmatch`."""
         ...
 
-    @staticmethod
-    def is_instance(value):
-        return hasattr(value, "fullmatch") and callable(value.fullmatch)
 
-
-def compile_pattern(value) -> Matcher:
-    """Compile pattern to be matched.
+def _compile_pattern(value) -> Matcher:
+    """Factory function that compiles pattern to be matched.
 
     This function returns a function that accepts one argument and returns a
     truth-y/false-y value if the pattern matches or not the argument.
-
-    If ``value`` is a string and have the format ``/.../`` (starts and ends with a
-    ``/``) it will be compiled to a regex.
-
-    If ``value`` is a string and have any of the characters ``*, ?, [`` it will be
-    compiled to a regex according to fnmatch.
 
     If ``value`` has a ``fullmatch`` value, the same method will be returned.
 
@@ -77,65 +45,26 @@ def compile_pattern(value) -> Matcher:
 
     Otherwise, a function that just applies the ``==`` operator will be applied.
     """
-    if isinstance(value, str):
-        if value[0] == "/" and value[-1] == "/":
-            # TODO implement regex modifiers
-            return suppress(TypeError)(re.compile(value.strip("/")).fullmatch)
+    if hasattr(value, "fullmatch"):
+        return cast(Matchable, value).fullmatch
 
-        if any(ch in value for ch in ("*", "?", "[")):
-            return suppress(TypeError)(re.compile(fnmatch.translate(value)).fullmatch)
-
-    if _Matchable.is_instance(value):
-        return suppress(TypeError)(value.fullmatch)
+    if isinstance(value, (list, tuple)):
+        return _compile_seq_pattern(value)
 
     if value is Ellipsis:
         return lambda _: True
 
+    if isinstance(value, Pattern):
+        return value.__call__
+
     return lambda x: x == value
 
 
-class Pattern:
-    def __new__(cls, value: PatternLike) -> "Pattern":
-        if isinstance(value, cls):
-            return value
-        return object.__new__(cls)
+def _compile_seq_pattern(value: Union[tuple, list]) -> Matcher:
+    _pattern = tuple(_compile_pattern(p) for p in value)
 
-    def __init__(self, value: Union[str, Matchable]):
-        self._value = value
-        self._matcher: Matcher = compile_pattern(value)
-
-    @property
-    def matcher(self) -> Matcher:
-        return self._matcher
-
-    def __call__(self, value: Any) -> Any:
-        matcher = cast(Callable[[Any], Any], self._matcher)
-        return matcher(value)
-
-    def __str__(self):
-        return f"{type(self).__name__}({pformat(self._value, sort_dicts=False)})"
-
-    def __repr__(self):
-        return (
-            f"<{type(self).__name__} at {id(self):#x} "
-            "{pformat(self._value, sort_dicts=False)}>"
-        )
-
-
-class TuplePattern(Pattern):
-    def __new__(cls, value: Union["TuplePattern", tuple]) -> "TuplePattern":
-        if isinstance(value, cls):
-            return value
-        return object.__new__(cls)
-
-    def __init__(self, value: Any):
-        if not isinstance(value, tuple):
-            value = (value,)
-        self._value = value
-        self._pattern = tuple(compile_pattern(p) for p in value)
-
-    def __call__(self, value: Iterable) -> bool:
-        matchers = cast(Iterator[Callable[[Any], Any]], iter(self._pattern))
+    def __call__(value: Any) -> Any:
+        matchers = cast(Iterator[Callable[[Any], Any]], iter(_pattern))
         items = iter(value)
         if any(not matcher(item) for matcher, item in zip(matchers, items)):
             return False
@@ -148,16 +77,51 @@ class TuplePattern(Pattern):
             return False
         return True
 
-    @property
-    def matcher(self) -> Matcher:
-        return self.__call__
+    return __call__
 
 
-def pattern(value, *other) -> Union[Pattern, TuplePattern]:
+class Pattern:
+    """Callable object that matches the __init__ arg with the __call__ arg.
+
+    This is the base class of the hierarchy and is very dump
+    """
+
+    def __new__(cls, value: Any):
+        if isinstance(value, Pattern):
+            return value
+        return object.__new__(cls)
+
+    def __init__(self, value: Any):
+        self._value = value
+        self._matcher = _compile_pattern(value)
+
+    def __call__(self, value: Any) -> Any:
+        matcher = self._matcher
+        try:
+            return matcher(value)
+        except TypeError:
+            return False
+
+    def _format(self):
+        return pformat(self._value, sort_dicts=False)
+
+    def __str__(self):
+        return f"{type(self).__name__}({self._format()})"
+
+    def __repr__(self):
+        return f"<{type(self).__name__} at {id(self):#x} -> {self._format()}>"
+
+
+def re(value: str, flags: FlagsType = 0):
+    return Pattern(_re.compile(value, flags))
+
+
+def glob(value: str):
+    return Pattern(_re.compile(fnmatch.translate(value)))
+
+
+def pattern(value, *other) -> Pattern:
     if len(other) > 0:
         value = (value, *other)
-
-    if isinstance(value, (tuple, TuplePattern)):
-        return TuplePattern(value)
 
     return Pattern(value)
