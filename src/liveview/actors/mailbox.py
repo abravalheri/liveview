@@ -14,29 +14,17 @@ from typing import (
     overload
 )
 
-from ..exceptions import init_with_docstring
 from ..utils import NO_VALUE, OptVal
-from .pattern import Pattern as _Pattern, TuplePattern, pattern
+from .pattern import Pattern, pattern
 
 T = TypeVar("T")
 S = TypeVar("S")
-Pattern = Union[_Pattern, TuplePattern]
 Topic = Union[str, tuple]
 
 
-def is_topic(value):
-    return isinstance(value, (str, tuple))
-
-
-class NoValueFound(asyncio.QueueEmpty):
-    """It is impossible to find in the queue any value that matches the pattern."""
-
-    __init__ = init_with_docstring  # noqa
-
-
 def _select_value(value, selectors, callbacks):
-    for j in enumerate(selectors):
-        if selectors[j].match(value):
+    for j, selector in enumerate(selectors):
+        if selector(value):
             if callbacks:
                 return value, callbacks[j]
             return value, None
@@ -148,12 +136,9 @@ class Mailbox(Generic[T]):
         encapsulating the common parts.
         """
         n = len(args)
-        if n == 1 and isinstance(args, dict):
+        if n == 1 and isinstance(args[0], dict):
             selectors = list(args[0].keys())
-            callbacks = list(args[0].items())
-        elif any(not is_topic(a) for a in args):
-            # TODO Better exception
-            raise ValueError("Argument should be Topic or dict")
+            callbacks = list(args[0].values())
         else:
             selectors = args
             callbacks = []
@@ -181,7 +166,7 @@ class Mailbox(Generic[T]):
         while True:
             item = await self._queue.get()
             value, callback = _select_value(item, selectors, callbacks)
-            if value:
+            if value is not NO_VALUE:
                 return value, callback
             else:
                 self._pending.append(item)
@@ -193,23 +178,26 @@ class Mailbox(Generic[T]):
         default: OptVal[T] = NO_VALUE,
     ) -> Tuple[OptVal[T], Optional[Callable[[T], S]]]:
         try:
-            item = self._queue.get_nowait()
-            value, callback = _select_value(item, selectors, callbacks)
-            if value:
-                return value, callback
-            else:
-                self._pending.append(item)
-                raise NoValueFound
+            while True:
+                item = self._queue.get_nowait()
+                value, callback = _select_value(item, selectors, callbacks)
+                if value is not NO_VALUE:
+                    return value, callback
+                else:
+                    self._pending.append(item)
         except asyncio.QueueEmpty:
             if default is not NO_VALUE:
                 return default, None
             raise
 
-    def _format(self):
+    def _size(self):
         return f"[queued: {self._queue.qsize()} + pending: {len(self._pending)}]"
 
     def __str__(self):
-        return f"<{type(self).__name__}{self._format()}>"
+        return f"<{type(self).__name__}{self._size()}>"
 
     def __repr__(self):
-        return f"<{type(self).__name__}{self._format()} at {id(self):#x} >"
+        return (
+            f"<{type(self).__name__} at {id(self):#x} "
+            f"queue={self._queue}, pending={self._pending}>"
+        )
