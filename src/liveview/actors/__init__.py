@@ -27,6 +27,7 @@ from typing import (
 )
 
 from ..exceptions import init_with_docstring
+from ..utils import ReprEnum
 from .messaging import (
     CALL,
     CAST,
@@ -43,7 +44,6 @@ from .messaging import (
     Error,
     Message,
     Other,
-    ReprEnum,
     Response,
     Token as TopicToken
 )

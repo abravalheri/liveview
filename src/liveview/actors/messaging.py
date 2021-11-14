@@ -1,12 +1,13 @@
 import logging
 from asyncio import Future
 from enum import IntEnum
-from typing import TYPE_CHECKING, Generic, Optional, Tuple, TypeVar, Union
+from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar, Union
 
 if TYPE_CHECKING:
     from . import Actor, MonitorRef as Reference  # noqa
 
 T = TypeVar("T")
+S = TypeVar("S")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -44,6 +45,10 @@ class Token(IntEnum):
 ) = list(Token)
 
 
+ResponseCallback = Union[Callable[[T], S], Callable[[T], "Response[S]"]]
+MappedResponse = Union["Response[T]", "Response[S]"]
+
+
 class Response(tuple, Generic[T]):
     status: Token
     value: T
@@ -54,18 +59,24 @@ class Response(tuple, Generic[T]):
         self.value = value
         return self
 
-    def map(self, fn):
+    def success(self, fn: ResponseCallback) -> MappedResponse:
         if self.status == ERROR:
             return self
         try:
+            result = fn(self.value)
+            if isinstance(result, Response):
+                return result
             return Ok(fn(self.value))
         except Exception as ex:
             return Error(ex)
 
-    def fix(self, fn):
+    def failure(self, fn: ResponseCallback) -> MappedResponse:
         if self.status == OK:
             return self
         try:
+            result = fn(self.value)
+            if isinstance(result, Response):
+                return result
             return Ok(fn(self.value))
         except Exception as ex:
             return Error(ex)
@@ -86,12 +97,12 @@ class Error(Response):
 
 
 ReplyToType = Union["Actor", Tuple["Actor", Future]]
-Topic = Tuple[Token, str]
 
 
 class Message(tuple, Generic[T]):
     to: "Actor"
-    topic: Topic
+    categorty: Literal[OTHER, CALL, CAST, ERROR, REPLY
+    topic: str
     payload: T
     sender: "Actor"
     reference: Optional["Reference"] = None
